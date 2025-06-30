@@ -271,3 +271,218 @@
         (ok true)
     )
 )
+
+;; Public function: Initiate dispute
+(define-public (initiate-dispute
+        (channel-id uint)
+        (proposed-balance-a uint)
+        (proposed-balance-b uint)
+        (dispute-nonce uint)
+    )
+    (let ((channel-data (unwrap! (map-get? channels { channel-id: channel-id })
+            ERR-CHANNEL-NOT-FOUND
+        )))
+        ;; Validations
+        (asserts! (is-channel-participant channel-id tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get state channel-data) CHANNEL-OPEN)
+            ERR-CHANNEL-CLOSED
+        )
+        (asserts!
+            (is-eq (+ proposed-balance-a proposed-balance-b)
+                (get total-amount channel-data)
+            )
+            ERR-INVALID-AMOUNT
+        )
+        (asserts! (>= dispute-nonce (get nonce channel-data)) ERR-INVALID-NONCE)
+        ;; Update channel to disputed state
+        (map-set channels { channel-id: channel-id }
+            (merge channel-data {
+                state: CHANNEL-DISPUTED,
+                last-update: stacks-block-height,
+            })
+        )
+        ;; Create dispute record
+        (map-set channel-disputes { channel-id: channel-id } {
+            initiator: tx-sender,
+            dispute-block: stacks-block-height,
+            proposed-balance-a: proposed-balance-a,
+            proposed-balance-b: proposed-balance-b,
+            dispute-nonce: dispute-nonce,
+        })
+        (print {
+            event: "dispute-initiated",
+            channel-id: channel-id,
+            initiator: tx-sender,
+            dispute-nonce: dispute-nonce,
+        })
+        (ok true)
+    )
+)
+
+;; Public function: Resolve dispute (after timeout)
+(define-public (resolve-dispute (channel-id uint))
+    (let (
+            (channel-data (unwrap! (map-get? channels { channel-id: channel-id })
+                ERR-CHANNEL-NOT-FOUND
+            ))
+            (dispute-data (unwrap! (map-get? channel-disputes { channel-id: channel-id })
+                ERR-CHANNEL-NOT-FOUND
+            ))
+        )
+        ;; Validations
+        (asserts! (is-eq (get state channel-data) CHANNEL-DISPUTED)
+            ERR-DISPUTE-ACTIVE
+        )
+        (asserts!
+            (>= stacks-block-height
+                (+ (get dispute-block dispute-data) DISPUTE-TIMEOUT)
+            )
+            ERR-TIMEOUT-NOT-REACHED
+        )
+        ;; Settle with disputed balances
+        (try! (as-contract (stx-transfer? (get proposed-balance-a dispute-data) tx-sender
+            (get participant-a channel-data)
+        )))
+        (try! (as-contract (stx-transfer? (get proposed-balance-b dispute-data) tx-sender
+            (get participant-b channel-data)
+        )))
+        ;; Update state
+        (var-set total-locked
+            (- (var-get total-locked) (get total-amount channel-data))
+        )
+        (map-set channels { channel-id: channel-id }
+            (merge channel-data {
+                state: CHANNEL-CLOSED,
+                last-update: stacks-block-height,
+            })
+        )
+        (print {
+            event: "dispute-resolved",
+            channel-id: channel-id,
+        })
+        (ok true)
+    )
+)
+
+;; Public function: Close channel cooperatively
+(define-public (close-channel (channel-id uint))
+    (let ((channel-data (unwrap! (map-get? channels { channel-id: channel-id })
+            ERR-CHANNEL-NOT-FOUND
+        )))
+        ;; Validations
+        (asserts! (is-channel-participant channel-id tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get state channel-data) CHANNEL-OPEN)
+            ERR-CHANNEL-CLOSED
+        )
+        ;; Transfer final balances
+        (try! (as-contract (stx-transfer? (get balance-a channel-data) tx-sender
+            (get participant-a channel-data)
+        )))
+        (try! (as-contract (stx-transfer? (get balance-b channel-data) tx-sender
+            (get participant-b channel-data)
+        )))
+        ;; Update state
+        (var-set total-locked
+            (- (var-get total-locked) (get total-amount channel-data))
+        )
+        (map-set channels { channel-id: channel-id }
+            (merge channel-data {
+                state: CHANNEL-CLOSED,
+                last-update: stacks-block-height,
+            })
+        )
+        (print {
+            event: "channel-closed",
+            channel-id: channel-id,
+        })
+        (ok true)
+    )
+)
+
+;; Public function: Emergency close (timeout-based)
+(define-public (emergency-close (channel-id uint))
+    (let ((channel-data (unwrap! (map-get? channels { channel-id: channel-id })
+            ERR-CHANNEL-NOT-FOUND
+        )))
+        ;; Validations
+        (asserts! (is-channel-participant channel-id tx-sender) ERR-UNAUTHORIZED)
+        (asserts!
+            (or
+                (is-eq (get state channel-data) CHANNEL-OPEN)
+                (is-eq (get state channel-data) CHANNEL-DISPUTED)
+            )
+            ERR-CHANNEL-CLOSED
+        )
+        (asserts! (>= stacks-block-height (get timeout-block channel-data))
+            ERR-TIMEOUT-NOT-REACHED
+        )
+        ;; Emergency settlement with current balances
+        (try! (as-contract (stx-transfer? (get balance-a channel-data) tx-sender
+            (get participant-a channel-data)
+        )))
+        (try! (as-contract (stx-transfer? (get balance-b channel-data) tx-sender
+            (get participant-b channel-data)
+        )))
+        ;; Update state
+        (var-set total-locked
+            (- (var-get total-locked) (get total-amount channel-data))
+        )
+        (map-set channels { channel-id: channel-id }
+            (merge channel-data {
+                state: CHANNEL-CLOSED,
+                last-update: stacks-block-height,
+            })
+        )
+        (print {
+            event: "emergency-close",
+            channel-id: channel-id,
+        })
+        (ok true)
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-channel-details (channel-id uint))
+    (map-get? channels { channel-id: channel-id })
+)
+
+(define-read-only (get-channel-dispute (channel-id uint))
+    (map-get? channel-disputes { channel-id: channel-id })
+)
+
+(define-read-only (get-payment-commitment
+        (channel-id uint)
+        (nonce uint)
+    )
+    (map-get? payment-commitments {
+        channel-id: channel-id,
+        nonce: nonce,
+    })
+)
+
+(define-read-only (get-user-channel-count (user principal))
+    (default-to u0 (get channel-count (map-get? user-channels { user: user })))
+)
+
+(define-read-only (get-contract-stats)
+    {
+        total-channels: (var-get channel-counter),
+        total-locked: (var-get total-locked),
+        min-channel-amount: MIN-CHANNEL-AMOUNT,
+        max-channel-amount: MAX-CHANNEL-AMOUNT,
+        channel-timeout: CHANNEL-TIMEOUT,
+        dispute-timeout: DISPUTE-TIMEOUT,
+        settlement-fee: SETTLEMENT-FEE,
+    }
+)
+
+(define-read-only (is-channel-active (channel-id uint))
+    (match (map-get? channels { channel-id: channel-id })
+        channel-data (is-eq (get state channel-data) CHANNEL-OPEN)
+        false
+    )
+)
+
+(define-read-only (get-contract-balance)
+    (stx-get-balance (as-contract tx-sender))
+)
